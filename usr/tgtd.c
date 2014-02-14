@@ -55,13 +55,14 @@ static struct option const long_options[] = {
 	{"foreground", no_argument, 0, 'f'},
 	{"control-port", required_argument, 0, 'C'},
 	{"nr_iothreads", required_argument, 0, 't'},
+	{"nr_tcp_iothreads", required_argument, 0, 'T'},
 	{"debug", required_argument, 0, 'd'},
 	{"version", no_argument, 0, 'V'},
 	{"help", no_argument, 0, 'h'},
 	{0, 0, 0, 0},
 };
 
-static char *short_options = "fC:d:t:Vh";
+static char *short_options = "fC:d:t:VhT:";
 static char *spare_args;
 
 static void usage(int status)
@@ -77,6 +78,8 @@ static void usage(int status)
 		"-f, --foreground        make the program run in the foreground\n"
 		"-C, --control-port NNNN use port NNNN for the mgmt channel\n"
 		"-t, --nr_iothreads NNNN specify the number of I/O threads\n"
+		"-T, --nr_tcp_iothreads NNNN specify the number of I/O threads"
+		" for send/recv iSCSI PDU\n"
 		"-d, --debug debuglevel  print debugging information\n"
 		"-V, --version           print version and exit\n"
 		"-h, --help              display this help and exit\n",
@@ -552,6 +555,11 @@ int main(int argc, char **argv)
 			break;
 		case 't':
 			ret = str_to_int_gt(optarg, nr_iothreads, 0);
+			if (ret)
+				bad_optarg(ret, ch, optarg);
+			break;
+		case 'T':
+			ret = str_to_int_gt(optarg, nr_tcp_iothreads, 0);
 			if (ret)
 				bad_optarg(ret, ch, optarg);
 			break;

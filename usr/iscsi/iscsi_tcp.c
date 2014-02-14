@@ -37,6 +37,8 @@
 #include "util.h"
 #include "work.h"
 
+int nr_tcp_iothreads = 1;
+
 static void iscsi_tcp_st_event_handler(int fd, int events, void *data);
 static void iscsi_tcp_release(struct iscsi_connection *conn);
 static struct iscsi_task *iscsi_tcp_alloc_task(struct iscsi_connection *conn,

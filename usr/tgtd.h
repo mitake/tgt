@@ -257,6 +257,7 @@ enum mgmt_req_result {
 extern int system_active;
 extern int is_debug;
 extern int nr_iothreads;
+extern int nr_tcp_iothreads;
 extern struct list_head bst_list;
 
 extern int ipc_init(void);
