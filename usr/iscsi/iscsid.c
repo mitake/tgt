@@ -76,6 +76,26 @@ enum {
 	IOSTATE_TX_END,
 };
 
+int is_conn_rx_bhs(struct iscsi_connection *conn)
+{
+	return conn->rx_iostate == IOSTATE_RX_BHS;
+}
+
+int is_conn_rx_init_ahs(struct iscsi_connection *conn)
+{
+	return conn->rx_iostate == IOSTATE_RX_INIT_AHS;
+}
+
+int is_conn_rx_end(struct iscsi_connection *conn)
+{
+	return conn->rx_iostate == IOSTATE_RX_END;
+}
+
+int is_conn_tx_end(struct iscsi_connection *conn)
+{
+	return conn->tx_iostate == IOSTATE_TX_END;
+}
+
 void conn_read_pdu(struct iscsi_connection *conn)
 {
 	conn->rx_iostate = IOSTATE_RX_BHS;
