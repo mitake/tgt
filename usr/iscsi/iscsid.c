@@ -1996,7 +1996,7 @@ static int iscsi_task_tx_done(struct iscsi_connection *conn)
 	return 0;
 }
 
-static int iscsi_task_tx_start(struct iscsi_connection *conn)
+int iscsi_task_tx_start(struct iscsi_connection *conn)
 {
 	struct iscsi_task *task;
 	int is_rsp, err = 0;
@@ -2053,7 +2053,7 @@ static int do_recv(struct iscsi_connection *conn, int next_state)
 		return 0;
 	} else if (ret < 0) {
 		if (errno == EINTR || errno == EAGAIN)
-			return 0;
+			return -errno;
 		else
 			return -EIO;
 	}
@@ -2071,7 +2071,30 @@ static int do_recv(struct iscsi_connection *conn, int next_state)
 	return ret;
 }
 
-void iscsi_rx_handler(struct iscsi_connection *conn)
+int iscsi_rx_bhs_handler(struct iscsi_connection *conn)
+{
+	if (conn->rx_iostate != IOSTATE_RX_BHS) {
+		eprintf("invalid rx_iostate: %d\n", conn->rx_iostate);
+		exit(1);
+	}
+
+	return do_recv(conn, IOSTATE_RX_INIT_AHS);
+}
+
+void iscsi_pre_iostate_rx_init_ahs(struct iscsi_connection *conn)
+{
+	if (conn->state == STATE_SCSI) {
+		if (iscsi_task_rx_start(conn))
+			conn->state = STATE_CLOSE;
+	} else {
+		conn->rx_buffer = conn->req_buffer;
+		conn->req.ahs = conn->rx_buffer;
+		conn->req.data = conn->rx_buffer
+			+ conn->req.bhs.hlength * 4;
+	}
+}
+
+int iscsi_rx_handler(struct iscsi_connection *conn)
 {
 	int ret = 0, hdigest, ddigest;
 	uint32_t crc;
@@ -2085,23 +2108,7 @@ void iscsi_rx_handler(struct iscsi_connection *conn)
 		hdigest = ddigest = 0;
 again:
 	switch (conn->rx_iostate) {
-	case IOSTATE_RX_BHS:
-		ret = do_recv(conn, IOSTATE_RX_INIT_AHS);
-		if (ret <= 0 || conn->rx_iostate != IOSTATE_RX_INIT_AHS)
-			break;
 	case IOSTATE_RX_INIT_AHS:
-		if (conn->state == STATE_SCSI) {
-			ret = iscsi_task_rx_start(conn);
-			if (ret) {
-				conn->state = STATE_CLOSE;
-				break;
-			}
-		} else {
-			conn->rx_buffer = conn->req_buffer;
-			conn->req.ahs = conn->rx_buffer;
-			conn->req.data = conn->rx_buffer
-				+ conn->req.bhs.hlength * 4;
-		}
 		conn->req.ahssize = conn->req.bhs.hlength * 4;
 		conn->req.datasize = ntoh24(conn->req.bhs.dlength);
 		conn->rx_size = conn->req.ahssize;
@@ -2109,7 +2116,7 @@ again:
 		if (conn->state != STATE_SCSI &&
 		    conn->req.ahssize > INCOMING_BUFSIZE) {
 			conn->state = STATE_CLOSE;
-			return;
+			return -1;
 		}
 
 		if (conn->rx_size) {
@@ -2169,7 +2176,7 @@ again:
 				if (conn->req.ahssize + conn->rx_size >
 				    INCOMING_BUFSIZE) {
 					conn->state = STATE_CLOSE;
-					return;
+					return -1;
 				}
 			}
 		} else {
@@ -2207,16 +2214,24 @@ again:
 		exit(1);
 	}
 
-	if (ret < 0 ||
-	    conn->rx_iostate != IOSTATE_RX_END ||
-	    conn->state == STATE_CLOSE)
-		return;
+	if (ret < 0)
+		return ret;
+
+	if (conn->rx_iostate != IOSTATE_RX_END || conn->state == STATE_CLOSE)
+		return 0;
 
 	if (conn->rx_size) {
 		eprintf("error %d %d %d\n", conn->state, conn->rx_iostate,
 			conn->rx_size);
 		exit(1);
 	}
+
+	return 0;
+}
+
+void iscsi_rx_done(struct iscsi_connection *conn)
+{
+	int ret;
 
 	if (conn->state == STATE_SCSI) {
 		ret = iscsi_task_rx_done(conn);
@@ -2272,12 +2287,6 @@ int iscsi_tx_handler(struct iscsi_connection *conn)
 		ddigest = p[ISCSI_PARAM_DATADGST_EN].val & DIGEST_CRC32C;
 	} else
 		hdigest = ddigest = 0;
-
-	if (conn->state == STATE_SCSI && !conn->tx_task) {
-		ret = iscsi_task_tx_start(conn);
-		if (ret)
-			goto out;
-	}
 
 	/*
 	 * For rdma, grab the data-in or r2t packet and covert to
@@ -2398,6 +2407,14 @@ again:
 finish:
 	cmnd_finish(conn);
 
+out:
+	return ret;
+}
+
+void iscsi_tx_done(struct iscsi_connection *conn)
+{
+	int ret;
+
 	switch (conn->state) {
 	case STATE_KERNEL:
 		ret = conn_take_fd(conn);
@@ -2421,8 +2438,6 @@ finish:
 		break;
 	}
 
-out:
-	return ret;
 }
 
 int iscsi_transportid(int tid, uint64_t itn_id, char *buf, int size)

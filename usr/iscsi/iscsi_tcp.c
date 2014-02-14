@@ -37,7 +37,7 @@
 #include "util.h"
 #include "work.h"
 
-static void iscsi_tcp_event_handler(int fd, int events, void *data);
+static void iscsi_tcp_st_event_handler(int fd, int events, void *data);
 static void iscsi_tcp_release(struct iscsi_connection *conn);
 static struct iscsi_task *iscsi_tcp_alloc_task(struct iscsi_connection *conn,
 						size_t ext_len);
@@ -255,7 +255,7 @@ static void accept_connection(int afd, int events, void *data)
 	conn_read_pdu(conn);
 	set_non_blocking(fd);
 
-	ret = tgt_event_add(fd, EPOLLIN, iscsi_tcp_event_handler, conn);
+	ret = tgt_event_add(fd, EPOLLIN, iscsi_tcp_st_event_handler, conn);
 	if (ret) {
 		conn_exit(conn);
 		free(tcp_conn);
@@ -270,19 +270,52 @@ out:
 	return;
 }
 
-static void iscsi_tcp_event_handler(int fd, int events, void *data)
+static void iscsi_tcp_st_event_handler(int fd, int events, void *data)
 {
+	int ret;
+
 	struct iscsi_connection *conn = (struct iscsi_connection *) data;
 
-	if (events & EPOLLIN)
-		iscsi_rx_handler(conn);
+	if (events & EPOLLIN) {
+		if (is_conn_rx_bhs(conn)) {
+			ret = iscsi_rx_bhs_handler(conn);
+			if (!is_conn_rx_init_ahs(conn)
+			    || ret < 0 || conn->state == STATE_CLOSE)
+				goto epollin_end;
+		}
 
+		if (conn->state != STATE_CLOSE && is_conn_rx_init_ahs(conn)) {
+			iscsi_pre_iostate_rx_init_ahs(conn);
+
+			if (conn->state == STATE_CLOSE)
+				goto epollin_end;
+		}
+
+		if (conn->state != STATE_CLOSE)
+			iscsi_rx_handler(conn);
+
+		if (conn->state != STATE_CLOSE && is_conn_rx_end(conn))
+			iscsi_rx_done(conn);
+	}
+
+epollin_end:
 	if (conn->state == STATE_CLOSE)
 		dprintf("connection closed\n");
 
-	if (conn->state != STATE_CLOSE && events & EPOLLOUT)
-		iscsi_tx_handler(conn);
+	if (conn->state != STATE_CLOSE && events & EPOLLOUT) {
+		if (conn->state == STATE_SCSI && !conn->tx_task) {
+			if (iscsi_task_tx_start(conn))
+				goto epollout_end;
+		}
 
+		if (conn->state != STATE_CLOSE)
+			iscsi_tx_handler(conn);
+
+		if (conn->state != STATE_CLOSE && is_conn_tx_end(conn))
+			iscsi_tx_done(conn);
+	}
+
+epollout_end:
 	if (conn->state == STATE_CLOSE) {
 		dprintf("connection closed %p\n", conn);
 		conn_close(conn);
