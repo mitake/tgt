@@ -61,6 +61,9 @@ struct iscsi_tcp_connection {
 	long ttt;
 
 	struct iscsi_connection iscsi_conn;
+
+	int used_in_worker_thread;
+	int restore_events;
 };
 
 static inline struct iscsi_tcp_connection *TCP_CONN(struct iscsi_connection *conn)
@@ -588,9 +591,13 @@ static void iscsi_event_modify(struct iscsi_connection *conn, int events)
 	struct iscsi_tcp_connection *tcp_conn = TCP_CONN(conn);
 	int ret;
 
-	ret = tgt_event_modify(tcp_conn->fd, events);
-	if (ret)
-		eprintf("tgt_event_modify failed\n");
+	if (tcp_conn->used_in_worker_thread)
+		tcp_conn->restore_events = events;
+	else {
+		ret = tgt_event_modify(tcp_conn->fd, events);
+		if (ret)
+			eprintf("tgt_event_modify failed\n");
+	}
 }
 
 static struct iscsi_task *iscsi_tcp_alloc_task(struct iscsi_connection *conn,
