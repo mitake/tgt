@@ -88,6 +88,8 @@ void conn_close(struct iscsi_connection *conn)
 	struct iscsi_task *task, *tmp;
 	int ret;
 
+	conn->state = STATE_CLOSE;
+
 	if (conn->closed) {
 		eprintf("already closed %p %u\n", conn, conn->refcount);
 		return;
