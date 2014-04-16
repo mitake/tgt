@@ -70,6 +70,12 @@ struct iscsi_tcp_work {
 	enum iscsi_tcp_work_state state;
 };
 
+struct iscsi_tcp_per_thread_queue {
+	pthread_cond_t cond;
+	pthread_mutex_t mutex;
+	struct list_head work_list;
+};
+
 struct iscsi_tcp_connection {
 	int fd;
 
@@ -86,17 +92,9 @@ struct iscsi_tcp_connection {
 	int restore_events;
 
 	struct iscsi_tcp_work work;
+	int worker_done_fd;
+	struct iscsi_tcp_per_thread_queue *queue;
 };
-
-static LIST_HEAD(iscsi_tcp_work_list);
-static pthread_mutex_t iscsi_tcp_work_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t iscsi_tcp_work_cond = PTHREAD_COND_INITIALIZER;
-
-static LIST_HEAD(iscsi_tcp_work_finished_list);
-static pthread_mutex_t iscsi_tcp_work_finished_mutex =
-	PTHREAD_MUTEX_INITIALIZER;
-
-static int iscsi_tcp_work_done_fd;
 
 static pthread_mutex_t iscsi_tcp_worker_startup_mutex =
 	PTHREAD_MUTEX_INITIALIZER;
@@ -104,15 +102,15 @@ static pthread_mutex_t iscsi_tcp_worker_startup_mutex =
 static int iscsi_tcp_worker_stop;
 
 static pthread_t *iscsi_tcp_worker_threads;
+static struct iscsi_tcp_per_thread_queue *iscsi_tcp_per_thread_queues;
 
 static void queue_iscsi_tcp_work(struct iscsi_connection *conn, int events);
 
 static void iscsi_tcp_work_done_handler(int fd, int events, void *data)
 {
-	LIST_HEAD(list);
 	struct iscsi_tcp_work *work;
 	struct iscsi_connection *conn;
-	struct iscsi_tcp_connection *tcp_conn;
+	struct iscsi_tcp_connection *tcp_conn = data;
 	int ret, failed;
 	eventfd_t dummy;
 
@@ -122,73 +120,63 @@ static void iscsi_tcp_work_done_handler(int fd, int events, void *data)
 		exit(1);
 	}
 
-	pthread_mutex_lock(&iscsi_tcp_work_finished_mutex);
-	list_splice_init(&iscsi_tcp_work_finished_list, &list);
-	pthread_mutex_unlock(&iscsi_tcp_work_finished_mutex);
+	work = &tcp_conn->work;
+	conn = &tcp_conn->iscsi_conn;
 
-	while (!list_empty(&list)) {
-		work = list_first_entry(&list, struct iscsi_tcp_work, list);
-		list_del(&work->list);
+	tcp_conn->used_in_worker_thread = 0;
 
-		tcp_conn =
-			container_of(work, struct iscsi_tcp_connection, work);
-		conn = &tcp_conn->iscsi_conn;
+	ret = tgt_event_add(tcp_conn->fd, tcp_conn->restore_events,
+			    iscsi_tcp_mt_event_handler, conn);
+	if (ret < 0) {
+		/* fd is broken by worker threads */
+		failed = 1;
+		goto end;
+	}
 
-		tcp_conn->used_in_worker_thread = 0;
+	failed = 0;
 
-		ret = tgt_event_add(tcp_conn->fd, tcp_conn->restore_events,
-				    iscsi_tcp_mt_event_handler, conn);
-		if (ret < 0) {
-			/* fd is broken by worker threads */
-			failed = 1;
-			goto end;
-		}
+	if (conn->state == STATE_CLOSE)
+		goto end;
 
-		failed = 0;
+	switch (work->state) {
+	case ISCSI_TCP_WORK_RX_FAILED:
+	case ISCSI_TCP_WORK_TX_FAILED:
+		failed = 1;
+		goto end;
+	case ISCSI_TCP_WORK_RX:
+		if (is_conn_rx_end(conn))
+			iscsi_rx_done(conn);
+		break;
+	case ISCSI_TCP_WORK_RX_BHS:
+		if (is_conn_rx_bhs(conn))
+			/* EAGAIN or EINTR */
+			break;
 
+		iscsi_pre_iostate_rx_init_ahs(conn);
 		if (conn->state == STATE_CLOSE)
-			goto end;
-
-		switch (work->state) {
-		case ISCSI_TCP_WORK_RX_FAILED:
-		case ISCSI_TCP_WORK_TX_FAILED:
-			failed = 1;
-			goto end;
-		case ISCSI_TCP_WORK_RX:
-			if (is_conn_rx_end(conn))
-				iscsi_rx_done(conn);
 			break;
-		case ISCSI_TCP_WORK_RX_BHS:
-			if (is_conn_rx_bhs(conn))
-				/* EAGAIN or EINTR */
-				break;
 
-			iscsi_pre_iostate_rx_init_ahs(conn);
-			if (conn->state == STATE_CLOSE)
-				break;
+		/* bypass the main event loop */
+		work->state = ISCSI_TCP_WORK_RX;
+		queue_iscsi_tcp_work(conn, tcp_conn->restore_events);
+		return;
+	case ISCSI_TCP_WORK_TX:
+		if (is_conn_tx_end(conn))
+			iscsi_tx_done(conn);
+		break;
+	default:
+		eprintf("invalid state of iscsi work tcp: %d\n",
+			work->state);
+		exit(1);
+	}
 
-			/* bypass the main event loop */
-			work->state = ISCSI_TCP_WORK_RX;
-			queue_iscsi_tcp_work(conn, tcp_conn->restore_events);
-			continue;
-		case ISCSI_TCP_WORK_TX:
-			if (is_conn_tx_end(conn))
-				iscsi_tx_done(conn);
-			break;
-		default:
-			eprintf("invalid state of iscsi work tcp: %d\n",
-				work->state);
-			exit(1);
-		}
-
-		tcp_conn->restore_events = 0;
+	tcp_conn->restore_events = 0;
 
 end:
-		work->state = ISCSI_TCP_WORK_INIT;
-		if (failed || conn->state == STATE_CLOSE) {
-			dprintf("connection closed %p\n", conn);
-			conn_close(conn);
-		}
+	work->state = ISCSI_TCP_WORK_INIT;
+	if (failed || conn->state == STATE_CLOSE) {
+		dprintf("connection closed %p\n", conn);
+		conn_close(conn);
 	}
 }
 
@@ -199,6 +187,7 @@ static void *iscsi_tcp_worker_fn(void *arg)
 	struct iscsi_connection *conn;
 	struct iscsi_tcp_connection *tcp_conn;
 	int ret;
+	struct iscsi_tcp_per_thread_queue *queue = arg;
 
 	sigfillset(&set);
 	sigprocmask(SIG_BLOCK, &set, NULL);
@@ -209,25 +198,24 @@ static void *iscsi_tcp_worker_fn(void *arg)
 	dprintf("starting iscsi tcp worker thread: %lu\n", pthread_self());
 
 	while (!iscsi_tcp_worker_stop) {
-		pthread_mutex_lock(&iscsi_tcp_work_mutex);
+		pthread_mutex_lock(&queue->mutex);
 retest:
-		if (list_empty(&iscsi_tcp_work_list)) {
-			pthread_cond_wait(&iscsi_tcp_work_cond,
-					  &iscsi_tcp_work_mutex);
+		if (list_empty(&queue->work_list)) {
+			pthread_cond_wait(&queue->cond, &queue->mutex);
 
 			if (iscsi_tcp_worker_stop) {
-				pthread_mutex_unlock(&iscsi_tcp_work_mutex);
+				pthread_mutex_unlock(&queue->mutex);
 				pthread_exit(NULL);
 			}
 
 			goto retest;
 		}
 
-		work = list_first_entry(&iscsi_tcp_work_list,
+		work = list_first_entry(&queue->work_list,
 				       struct iscsi_tcp_work, list);
 
 		list_del(&work->list);
-		pthread_mutex_unlock(&iscsi_tcp_work_mutex);
+		pthread_mutex_unlock(&queue->mutex);
 
 		tcp_conn =
 			container_of(work, struct iscsi_tcp_connection, work);
@@ -270,11 +258,7 @@ retest:
 			exit(1);
 		}
 
-		pthread_mutex_lock(&iscsi_tcp_work_finished_mutex);
-		list_add_tail(&work->list, &iscsi_tcp_work_finished_list);
-		pthread_mutex_unlock(&iscsi_tcp_work_finished_mutex);
-
-		ret = eventfd_write(iscsi_tcp_work_done_fd, 1);
+		ret = eventfd_write(tcp_conn->worker_done_fd, 1);
 		if (ret < 0) {
 			eprintf("iscsi tcp work error: %m\n");
 			exit(1);
@@ -293,6 +277,7 @@ static void queue_iscsi_tcp_work(struct iscsi_connection *conn, int events)
 {
 	struct iscsi_tcp_connection *tcp_conn = TCP_CONN(conn);
 	struct iscsi_tcp_work *work = &tcp_conn->work;
+	struct iscsi_tcp_per_thread_queue *queue = tcp_conn->queue;
 
 	tcp_conn->used_in_worker_thread = 1;
 
@@ -300,11 +285,11 @@ static void queue_iscsi_tcp_work(struct iscsi_connection *conn, int events)
 
 	tgt_event_del(tcp_conn->fd);
 
-	pthread_mutex_lock(&iscsi_tcp_work_mutex);
-	list_add_tail(&work->list, &iscsi_tcp_work_list);
-	pthread_mutex_unlock(&iscsi_tcp_work_mutex);
+	pthread_mutex_lock(&queue->mutex);
+	list_add_tail(&work->list, &queue->work_list);
+	pthread_mutex_unlock(&queue->mutex);
 
-	pthread_cond_signal(&iscsi_tcp_work_cond);
+	pthread_cond_signal(&queue->cond);
 }
 
 static struct tgt_work nop_work;
@@ -450,6 +435,17 @@ static int set_nodelay(int fd)
 	return ret;
 }
 
+static struct iscsi_tcp_per_thread_queue *pick_queue(void)
+{
+	static int next_idx;
+	struct iscsi_tcp_per_thread_queue *ret;
+
+	ret = &iscsi_tcp_per_thread_queues[next_idx++];
+	next_idx %= nr_tcp_iothreads;
+
+	return ret;
+}
+
 static void accept_connection(int afd, int events, void *data)
 {
 	struct sockaddr_storage from;
@@ -491,10 +487,8 @@ static void accept_connection(int afd, int events, void *data)
 	conn = &tcp_conn->iscsi_conn;
 
 	ret = conn_init(conn);
-	if (ret) {
-		free(tcp_conn);
-		goto out;
-	}
+	if (ret)
+		goto free_tcp_conn;
 
 	tcp_conn->fd = fd;
 	conn->tp = &iscsi_tcp;
@@ -507,15 +501,35 @@ static void accept_connection(int afd, int events, void *data)
 			    iscsi_tcp_st_event_handler :
 			    iscsi_tcp_mt_event_handler,
 			    conn);
-	if (ret) {
-		conn_exit(conn);
-		free(tcp_conn);
-		goto out;
+	if (ret)
+		goto conn_exit2;
+
+	if (1 < nr_tcp_iothreads) {
+		tcp_conn->worker_done_fd = eventfd(0, O_NONBLOCK);
+		if (tcp_conn->worker_done_fd < 0)
+			goto del_ev_fd;
+
+		ret = tgt_event_add(tcp_conn->worker_done_fd, EPOLLIN,
+				    iscsi_tcp_work_done_handler, tcp_conn);
+		if (ret)
+			goto close_done_fd;
+
+		tcp_conn->queue = pick_queue();
 	}
 
 	list_add(&tcp_conn->tcp_conn_siblings, &iscsi_tcp_conn_list);
 
 	return;
+
+close_done_fd:
+	close(tcp_conn->worker_done_fd);
+del_ev_fd:
+	tgt_event_del(fd);
+conn_exit2:
+	conn_exit(conn);
+free_tcp_conn:
+	free(tcp_conn);
+
 out:
 	close(fd);
 	return;
@@ -760,21 +774,6 @@ static int iscsi_tcp_init(void)
 	add_work(&nop_work, 1);
 
 	if (1 < nr_tcp_iothreads) {
-		iscsi_tcp_work_done_fd = eventfd(0, EFD_NONBLOCK);
-		if (iscsi_tcp_work_done_fd < 0) {
-			eprintf("failed to create eventfd for tcp work: %m\n");
-			return -1;
-		}
-
-		ret = tgt_event_add(iscsi_tcp_work_done_fd, EPOLLIN,
-				    iscsi_tcp_work_done_handler, NULL);
-		if (ret < 0) {
-			eprintf("failed to register"\
-				"iscsi_tcp_work_done_handler(): %m\n");
-			ret = -1;
-			goto close_done_fd;
-		}
-
 		iscsi_tcp_worker_threads = calloc(nr_tcp_iothreads,
 						  sizeof(pthread_t));
 		if (!iscsi_tcp_worker_threads) {
@@ -782,13 +781,29 @@ static int iscsi_tcp_init(void)
 				" identifier: %m\n");
 			ret = -1;
 
-			goto close_done_fd;
+			goto out;
+		}
+
+		iscsi_tcp_per_thread_queues = calloc(nr_tcp_iothreads,
+				     sizeof(struct iscsi_tcp_per_thread_queue));
+		if (!iscsi_tcp_per_thread_queues) {
+			eprintf("failed to allocate memory for per thread"\
+				"work queue: %m\n");
+			ret = -1;
+			goto free_worker_threads;
 		}
 
 		pthread_mutex_lock(&iscsi_tcp_worker_startup_mutex);
 		for (i = 0; i < nr_tcp_iothreads; i++) {
+			struct iscsi_tcp_per_thread_queue *queue =
+				&iscsi_tcp_per_thread_queues[i];
+
+			pthread_mutex_init(&queue->mutex, NULL);
+			pthread_cond_init(&queue->cond, NULL);
+			INIT_LIST_HEAD(&queue->work_list);
+
 			ret = pthread_create(&iscsi_tcp_worker_threads[i], NULL,
-					     iscsi_tcp_worker_fn, NULL);
+					     iscsi_tcp_worker_fn, queue);
 			if (ret) {
 				eprintf("creating worker thread failed: %m\n");
 				ret = -1;
@@ -807,10 +822,10 @@ terminate_workers:
 		for (; 0 <= i; i--)
 			pthread_join(iscsi_tcp_worker_threads[i], NULL);
 
-		free(iscsi_tcp_worker_threads);
+		free(iscsi_tcp_per_thread_queues);
 
-close_done_fd:
-		close(iscsi_tcp_work_done_fd);
+free_worker_threads:
+		free(iscsi_tcp_worker_threads);
 	}
 
 out:
@@ -829,7 +844,7 @@ static void iscsi_tcp_exit(void)
 
 	iscsi_tcp_worker_stop = 1;
 	for (i = 0; i < nr_tcp_iothreads; i++) {
-		pthread_cond_signal(&iscsi_tcp_work_cond);
+		pthread_cond_signal(&iscsi_tcp_per_thread_queues[i].cond);
 		pthread_join(iscsi_tcp_worker_threads[i], NULL);
 	}
 }
@@ -889,6 +904,8 @@ static size_t iscsi_tcp_close(struct iscsi_connection *conn)
 	struct iscsi_tcp_connection *tcp_conn = TCP_CONN(conn);
 
 	tgt_event_del(tcp_conn->fd);
+	tgt_event_del(tcp_conn->worker_done_fd);
+
 	return 0;
 }
 
