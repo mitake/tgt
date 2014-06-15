@@ -94,6 +94,8 @@
 #define SD_RES_JOIN_FAILED   0x18 /* Target node had failed to join sheepdog */
 #define SD_RES_HALT          0x19 /* Sheepdog is stopped serving IO request */
 #define SD_RES_READONLY      0x1A /* Object is read-only */
+#define SD_RES_INCOMPLETE    0x1B /* Object (in kv) is incomplete uploading */
+#define SD_RES_NEED_INODE_RELOAD   0x1C
 
 /*
  * Object ID rules
@@ -613,13 +615,14 @@ static int find_vdi_name(struct sheepdog_access_info *ai, char *filename,
 			 uint32_t snapid, char *tag, uint32_t *vid,
 			 int for_snapshot);
 static int read_object(struct sheepdog_access_info *ai, char *buf, uint64_t oid,
-		       int copies, unsigned int datalen, uint64_t offset);
+		       int copies, unsigned int datalen, uint64_t offset, int *need_reload);
 
 static int reload_inode(struct sheepdog_access_info *ai)
 {
 	int ret;
 	char tag[SD_MAX_VDI_TAG_LEN];
 	uint32_t vid;
+	int need_reload = 0;
 
 	memset(tag, 0, sizeof(tag));
 
@@ -628,7 +631,7 @@ static int reload_inode(struct sheepdog_access_info *ai)
 		return -1;
 
 	ret = read_object(ai, (char *)&ai->inode, vid_to_vdi_oid(vid),
-			  ai->inode.nr_copies, SD_INODE_SIZE, 0);
+			  ai->inode.nr_copies, SD_INODE_SIZE, 0, &need_reload);
 	if (ret)
 		return -1;
 
@@ -679,6 +682,7 @@ static int read_write_object(struct sheepdog_access_info *ai, char *buf,
 	switch (rsp->result) {
 	case SD_RES_SUCCESS:
 		return 0;
+	case SD_RES_NEED_INODE_RELOAD:
 	case SD_RES_READONLY:
 		if (need_reload)
 			*need_reload = 1;
@@ -692,10 +696,10 @@ static int read_write_object(struct sheepdog_access_info *ai, char *buf,
 
 static int read_object(struct sheepdog_access_info *ai, char *buf,
 		       uint64_t oid, int copies,
-		       unsigned int datalen, uint64_t offset)
+		       unsigned int datalen, uint64_t offset, int *need_reload)
 {
 	return read_write_object(ai, buf, oid, copies, datalen, offset,
-				 0, 0, 0, 0, NULL);
+				 0, 0, 0, 0, need_reload);
 }
 
 static int write_object(struct sheepdog_access_info *ai, char *buf,
@@ -845,7 +849,12 @@ retry:
 
 			ret = read_object(ai, buf + (len - rest),
 					  oid, nr_copies, size,
-					  obj_offset);
+					  obj_offset, &need_update_inode);
+			if (need_reload_inode) {
+				ret = reload_inode(ai);
+				if (!ret)
+					goto retry;
+			}
 		}
 
 		if (ret) {
@@ -932,6 +941,7 @@ static int sd_open(struct sheepdog_access_info *ai, char *filename, int flags)
 		EXPECT_TAG_OR_SNAP,
 		EXPECT_NOTHING,
 	} parse_state = EXPECT_PROTO;
+	int need_reload;
 
 	memset(tag, 0, sizeof(tag));
 	memset(vdi_name, 0, sizeof(vdi_name));
@@ -1075,7 +1085,7 @@ trans_to_expect_nothing:
 	ai->max_dirty_data_idx = 0;
 
 	ret = read_object(ai, (char *)&ai->inode, vid_to_vdi_oid(vid),
-			  0, SD_INODE_SIZE, 0);
+			  0, SD_INODE_SIZE, 0, &need_reload);
 	if (ret)
 		goto out;
 
@@ -1119,6 +1129,7 @@ static int create_branch(struct sheepdog_access_info *ai)
 	struct sheepdog_vdi_rsp *rsp = (struct sheepdog_vdi_rsp *)&hdr;
 	unsigned int wlen = 0, rlen;
 	int ret;
+	int need_reload = 0;
 
 	ret = pthread_rwlock_wrlock(&ai->inode_lock);
 	if (ret) {
@@ -1162,7 +1173,7 @@ static int create_branch(struct sheepdog_access_info *ai)
 	}
 
 	ret = read_object(ai, (char *)&ai->inode, vid_to_vdi_oid(rsp->vdi_id),
-			  ai->inode.nr_copies, SD_INODE_SIZE, 0);
+			  ai->inode.nr_copies, SD_INODE_SIZE, 0, &need_reload);
 	if (ret) {
 		eprintf("reloading new inode object failed");
 		goto out;
