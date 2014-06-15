@@ -166,6 +166,9 @@ struct sheepdog_obj_rsp {
 	uint32_t pad[6];
 };
 
+#define SD_LOCK_TYPE_DEFAULT 1  /* for qemu */
+#define SD_LOCK_TYPE_SHARED 2   /* for iSCSI */
+
 struct sheepdog_vdi_req {
 	uint8_t proto_ver;
 	uint8_t opcode;
@@ -177,7 +180,8 @@ struct sheepdog_vdi_req {
 	uint32_t vdi_id;
 	uint32_t copies;
 	uint32_t snapid;
-	uint32_t pad[3];
+	uint32_t lock_type;
+	uint32_t pad[2];
 };
 
 struct sheepdog_vdi_rsp {
@@ -888,6 +892,7 @@ static int find_vdi_name(struct sheepdog_access_info *ai, char *filename,
 	hdr.data_length = wlen;
 	hdr.snapid = snapid;
 	hdr.flags = SD_FLAG_CMD_WRITE;
+	hdr.lock_type = SD_LOCK_TYPE_SHARED;
 
 	ret = do_req(ai, (struct sheepdog_req *)&hdr, buf, &wlen, &rlen);
 	if (ret) {
@@ -904,7 +909,6 @@ static int find_vdi_name(struct sheepdog_access_info *ai, char *filename,
 	*vid = rsp->vdi_id;
 
 	ret = 0;
-
 out:
 	return ret;
 }
