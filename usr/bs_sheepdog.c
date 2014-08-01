@@ -166,6 +166,9 @@ struct sheepdog_obj_rsp {
 	uint32_t pad[6];
 };
 
+#define LOCK_TYPE_NORMAL 1
+#define LOCK_TYPE_SHARED 2      /* for iSCSI multipath */
+
 struct sheepdog_vdi_req {
 	uint8_t proto_ver;
 	uint8_t opcode;
@@ -177,7 +180,8 @@ struct sheepdog_vdi_req {
 	uint32_t vdi_id;
 	uint32_t copies;
 	uint32_t snapid;
-	uint32_t pad[3];
+	uint32_t type;
+	uint32_t pad[2];
 };
 
 struct sheepdog_vdi_rsp {
@@ -905,6 +909,7 @@ static int find_vdi_name(struct sheepdog_access_info *ai, char *filename,
 		hdr.opcode = SD_OP_GET_VDI_INFO;
 	else
 		hdr.opcode = SD_OP_LOCK_VDI;
+	hdr.type = LOCK_TYPE_SHARED;
 
 	wlen = SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN;
 	hdr.proto_ver = SD_PROTO_VER;
@@ -1116,6 +1121,7 @@ static void sd_close(struct sheepdog_access_info *ai)
 	memset(&hdr, 0, sizeof(hdr));
 
 	hdr.opcode = SD_OP_RELEASE_VDI;
+	hdr.type = LOCK_TYPE_SHARED;
 	hdr.vdi_id = ai->inode.vdi_id;
 
 	ret = do_req(ai, (struct sheepdog_req *)&hdr, NULL, &wlen, &rlen);
