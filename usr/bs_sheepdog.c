@@ -291,6 +291,10 @@ struct sheepdog_access_info {
 
 	struct sheepdog_inode inode;
 	pthread_rwlock_t inode_lock;
+
+	struct list_head inflight_list_head;
+	pthread_mutex_t inflight_list_mutex;
+	pthread_cond_t inflight_list_cond;
 };
 
 static inline int is_data_obj_writeable(struct sheepdog_inode *inode,
@@ -1245,6 +1249,11 @@ trans_to_expect_nothing:
 		goto out;
 
 	ret = 0;
+
+	INIT_LIST_HEAD(&ai->inflight_list_head);
+	pthread_mutex_init(&ai->inflight_list_mutex, NULL);
+	pthread_cond_init(&ai->inflight_list_cond, NULL);
+
 out:
 	strcpy(filename, orig_filename);
 	free(orig_filename);
@@ -1342,6 +1351,44 @@ out:
 	return ret;
 }
 
+struct inflight_thread {
+	unsigned long min_idx, max_idx;
+	struct list_head list;
+};
+
+static void inflight_block(struct sheepdog_access_info *ai,
+			   struct inflight_thread *myself)
+{
+	struct inflight_thread *inflight;
+
+retry:
+	pthread_mutex_lock(&ai->inflight_list_mutex);
+
+	list_for_each_entry(inflight, &ai->inflight_list_head, list) {
+		if (!(myself->max_idx < inflight->min_idx ||
+		      inflight->max_idx < myself->min_idx))
+			goto conflict;
+	}
+
+	list_add_tail(&myself->list, &ai->inflight_list_head);
+	pthread_mutex_unlock(&ai->inflight_list_mutex);
+
+	return;
+
+conflict:
+	pthread_cond_wait(&ai->inflight_list_cond, &ai->inflight_list_mutex);
+	goto retry;
+}
+ void inflight_release(struct sheepdog_access_info *ai,
+			     struct inflight_thread *myself)
+{
+	pthread_mutex_lock(&ai->inflight_list_mutex);
+	list_del(&myself->list);
+	pthread_mutex_unlock(&ai->inflight_list_mutex);
+
+	pthread_cond_signal(&ai->inflight_list_cond);
+}
+
 static void bs_sheepdog_request(struct scsi_cmd *cmd)
 {
 	int ret = 0;
@@ -1352,6 +1399,13 @@ static void bs_sheepdog_request(struct scsi_cmd *cmd)
 	struct bs_thread_info *info = BS_THREAD_I(cmd->dev);
 	struct sheepdog_access_info *ai =
 		(struct sheepdog_access_info *)(info + 1);
+
+	uint32_t object_size = (UINT32_C(1) << ai->inode.block_size_shift);
+	struct inflight_thread myself;
+	int inflight = 0;
+
+	memset(&myself, 0, sizeof(myself));
+	INIT_LIST_HEAD(&myself.list);
 
 	switch (cmd->scb[0]) {
 	case SYNCHRONIZE_CACHE:
@@ -1376,6 +1430,13 @@ static void bs_sheepdog_request(struct scsi_cmd *cmd)
 		}
 
 		length = scsi_get_out_length(cmd);
+
+		myself.min_idx = cmd->offset / object_size;
+		myself.max_idx = (cmd->offset + length + (object_size - 1))
+			/ object_size;
+		inflight_block(ai, &myself);
+		inflight = 1;
+
 		ret = sd_io(ai, 1, scsi_get_out_buffer(cmd),
 			    length, cmd->offset);
 
@@ -1387,6 +1448,13 @@ static void bs_sheepdog_request(struct scsi_cmd *cmd)
 	case READ_12:
 	case READ_16:
 		length = scsi_get_in_length(cmd);
+
+		myself.min_idx = cmd->offset / object_size;
+		myself.max_idx = (cmd->offset + length + (object_size - 1))
+			/ object_size;
+		inflight_block(ai, &myself);
+		inflight = 1;
+
 		ret = sd_io(ai, 0, scsi_get_in_buffer(cmd),
 			    length, cmd->offset);
 		if (ret)
@@ -1406,6 +1474,9 @@ static void bs_sheepdog_request(struct scsi_cmd *cmd)
 			cmd, cmd->scb[0], ret, length, cmd->offset);
 		sense_data_build(cmd, key, asc);
 	}
+
+	if (inflight)
+		inflight_release(ai, &myself);
 }
 
 static int bs_sheepdog_open(struct scsi_lu *lu, char *path,
