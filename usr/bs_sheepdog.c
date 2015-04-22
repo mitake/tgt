@@ -959,8 +959,25 @@ retry:
 					 * If it is 2, inode object is
 					 * invalidated
 					 */
+					int need_wr2rd = 0;
+
+					if (!need_write_lock) {
+						/* I don't have write lock */
+						pthread_rwlock_unlock(&ai->inode_lock);
+
+						pthread_rwlock_wrlock(&ai->inode_lock);
+						need_wr2rd = 1;
+					}
+
 					ret = reload_inode(ai,
 						   need_reload_inode == 1);
+
+					if (need_wr2rd) {
+						/* back to read lock */
+						pthread_rwlock_unlock(&ai->inode_lock);
+						pthread_rwlock_rdlock(&ai->inode_lock);
+					}
+
 					if (!ret)
 						goto retry;
 				}
