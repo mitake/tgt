@@ -681,7 +681,7 @@ static int reload_inode(struct sheepdog_access_info *ai, int is_snapshot)
 		memset(tag, 0, sizeof(tag));
 
 		ret = find_vdi_name(ai, ai->inode.name, CURRENT_VDI_ID, tag,
-				    &vid, 0);
+				    &vid, 1);
 		if (ret) {
 			ret = -1;
 			goto ret;
