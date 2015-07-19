@@ -704,6 +704,34 @@ static int reload_inode(struct sheepdog_access_info *ai, int is_snapshot)
 			ret = -1;
 			goto ret;
 		}
+
+		if (!!ai->inode.snap_ctime) {
+			/*
+			 * This is a case like below:
+			 * take snapshot -> write something -> failover
+			 *
+			 * Because invalidated inode is readonly and latest
+			 * working VDI can have COWed objects, we need to
+			 * resolve VID and reload its entire inode object.
+			 */
+			memset(tag, 0, sizeof(tag));
+
+			ret = find_vdi_name(ai, ai->inode.name, CURRENT_VDI_ID,
+					    tag, &vid, 1);
+			if (ret) {
+				ret = -1;
+				goto ret;
+			}
+
+			ret = read_object(ai, (char *)&ai->inode,
+					  vid_to_vdi_oid(vid),
+					  ai->inode.nr_copies, SD_INODE_SIZE, 0,
+					  &need_reload);
+			if (ret) {
+				ret = -1;
+				goto ret;
+			}
+		}
 	}
 
 	ai->min_dirty_data_idx = UINT32_MAX;
@@ -905,6 +933,7 @@ static int sd_io(struct sheepdog_access_info *ai, int write, char *buf, int len,
 	int need_update_inode = 0, need_reload_inode;
 	int nr_copies = ai->inode.nr_copies;
 	int need_write_lock, check_idx;
+	int read_reload_snap = 0;
 
 	goto do_req;
 
@@ -912,7 +941,7 @@ reload_in_read_path:
 	pthread_rwlock_unlock(&ai->inode_lock); /* unlock current read lock */
 
 	pthread_rwlock_wrlock(&ai->inode_lock);
-	ret = reload_inode(ai, 0);
+	ret = reload_inode(ai, read_reload_snap);
 	if (ret) {
 		eprintf("failed to reload in read path\n");
 		goto out;
@@ -1008,6 +1037,8 @@ retry:
 					dprintf("reload in read path for not"\
 						" written area\n");
 					size = orig_size;
+					read_reload_snap =
+						need_reload_inode == 1;
 					goto reload_in_read_path;
 				}
 			}
@@ -1019,6 +1050,7 @@ retry:
 			if (need_reload_inode) {
 				dprintf("reload in ordinal read path\n");
 				size = orig_size;
+				read_reload_snap = need_reload_inode == 1;
 				goto reload_in_read_path;
 			}
 		}
