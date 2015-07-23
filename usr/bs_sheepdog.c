@@ -902,16 +902,18 @@ static int is_refresh_required(struct sheepdog_access_info *ai)
  * 1: refresh is required
  */
 {
-	uint64_t inode_oid = vid_to_vdi_oid(ai->inode.vdi_id);
+	uint64_t first_oid = vid_to_data_oid(ai->inode.vdi_id, 0);
 	char dummy;
 	int need_reload_inode = 0;
 
 	/*
 	 * Check inode of this tgtd is invaldiated or not.
-	 * The inode object is the only one object which always exists.
+	 * The existence of first object is not a problem. If the inode is
+	 * invalidated, gateway_read_obj() of sheepdog returns
+	 * SD_RES_INODE_INVALIDATED.
 	 */
 
-	read_object(ai, &dummy, inode_oid, ai->inode.nr_copies, sizeof(dummy),
+	read_object(ai, &dummy, first_oid, ai->inode.nr_copies, sizeof(dummy),
 		    0, &need_reload_inode);
 
 	return need_reload_inode;
